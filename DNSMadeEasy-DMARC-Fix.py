@@ -1,145 +1,313 @@
-import hmac
 import hashlib
-from email.utils import formatdate
-import requests
+import hmac
 import json
+import os
 import time
+from email.utils import formatdate
 
-#Generates headers based on current location time and date as per DME documentation
-def generate_dnsme_headers(api_key, secret_key):
-    #print("Generating DNSMadeEasy headers...")
-    # Generate current UTC date in HTTP format
-    date_string = formatdate(timeval=None, localtime=False, usegmt=True)
+import requests
+
+# =====================
+# CONFIGURATION
+# =====================
+
+BASE_URL = "https://api.dnsmadeeasy.com/V2.0"
+REQUEST_SLEEP = 2
+
+# Known DMARC policies that need updating
+KNOWN_DMARC_POLICIES = {
+    # add any known DMARC records here
+}
+
+# Domains to ignore (business critical domains)
+DOMAINS_TO_IGNORE = {
+    # Add domains here as needed
+}
+
+# =====================
+# DMARC NORMALIZATION
+# =====================
+
+def normalize_dmarc(record: str) -> str:
+    """
+    Normalize DMARC record for comparison:
+    - strips quotes
+    - splits on semicolons
+    - lowercases tag names
+    - sorts tags alphabetically
+    """
+    record = record.strip().strip('"')
+    parts = [
+        p.strip()
+        for p in record.split(";")
+        if p.strip() and "=" in p
+    ]
     
-    # Create HMAC SHA1 hash
-    key_bytes = secret_key.encode('utf-8')
-    message_bytes = date_string.encode('utf-8')
-    hmac_hash = hmac.new(key_bytes, message_bytes, hashlib.sha1).hexdigest()
+    parsed = []
+    for part in parts:
+        tag, value = part.split("=", 1)
+        parsed.append((tag.lower().strip(), value.strip()))
     
-    # Build headers
-    headers = {
+    parsed.sort(key=lambda x: x[0])
+    return "; ".join(f"{tag}={value}" for tag, value in parsed)
+
+NORMALIZED_KNOWN_DMARC_RECORDS = {
+    normalize_dmarc(p) for p in KNOWN_DMARC_POLICIES
+}
+
+# =====================
+# AUTH HEADERS
+# =====================
+
+def generate_headers(api_key, secret_key):
+    """Generate DME API authentication headers"""
+    date_string = formatdate(usegmt=True)
+    signature = hmac.new(
+        secret_key.encode("utf-8"),
+        date_string.encode("ascii"),
+        hashlib.sha1
+    ).hexdigest()
+    
+    return {
         "x-dnsme-apiKey": api_key,
         "x-dnsme-requestDate": date_string,
-        "x-dnsme-hmac": hmac_hash,
+        "x-dnsme-hmac": signature,
+        "Accept": "application/json",
         "Content-Type": "application/json",
         "Connection": "close",
     }
-    return headers
 
-#Retrieve all domains
-def get_domains(api_key, secret_key, url):
-    print("Retrieving domains...")
-    url = f"{base_url}dns/managed/"
-    generated_headers=generate_dnsme_headers(api_key, secret_key)
-    domains_json = requests.get(url, headers=generated_headers)
-    
-    if domains_json.status_code == 200:
-        domains_json = domains_json.json()
-        return domains_json.get("data", [])
-    else:
-        domains_json.raise_for_status()
-        return domains_json.get("data", [])
+# =====================
+# API CALLS
+# =====================
 
-#Retrieve domain records for each domain
-def get_specific_domain_records(domains):
-    print("Retrieving domain records...")
+def get_domains(api_key, secret_key):
+    """Retrieve all managed domains from DNSMadeEasy"""
+    url = f"{BASE_URL}/dns/managed"
+    resp = requests.get(url, headers=generate_headers(api_key, secret_key))
+    resp.raise_for_status()
+    return resp.json()["data"]
+
+def get_domain_records(api_key, secret_key, domain_id):
+    """Retrieve all records for a specific domain"""
+    url = f"{BASE_URL}/dns/managed/{domain_id}/records"
+    resp = requests.get(url, headers=generate_headers(api_key, secret_key))
+    resp.raise_for_status()
+    return resp.json().get("data", [])
+
+# =====================
+# DMARC PROCESSING
+# =====================
+
+def extract_dmarc_records(api_key, secret_key, domains):
+    """
+    Extract domains with DMARC records that need updating.
+    Writes results immediately to file for data persistence.
+    """
     count = 1
-    domain_with_records = {}
-    domain_ids = [domain['id'] for domain in domains]
-    for id in domain_ids:
-        time.sleep(2)
-        print(f"Domain number: {count}")
+    domains_without_dmarc = 0
+    domains_with_dmarc = 0
+    
+    # Clear output files
+    open("domains_without_dmarc.txt", "w").close()
+    open("domains_with_dmarc.txt", "w").close()
+    
+    for domain in domains:
+        time.sleep(REQUEST_SLEEP)
+        
+        print(f"Processing domain {count}: {domain['name']}")
         count += 1
-        generated_headers=generate_dnsme_headers(api_key, secret_key)
-        url = f"{base_url}dns/managed/{id}/records/"
-        records_json = requests.get(url, headers=generated_headers)
-        if records_json.status_code == 200:
-            records_json = records_json.json()
-            domain_name = next((d['name'] for d in domains if d['id'] == id))
-            domain_with_records[domain_name] = {
-                "domain_id": id,
-                "records": records_json.get("data", [])
-            }
-        else:
-            records_json.raise_for_status()
-    return domain_with_records
-
-
-# Check for domains without DMARC records
-def get_domain_without_dmarc_record(dns_records):
-    print("Checking for domains without DMARC records...")
-    for domains, payload in dns_records.items():
-            domain_id = payload["domain_id"]
-            records = payload["records"]
-            has_dmarc = any(record['type'] == 'TXT' and "v=DMARC" in record['value'] for record in records)
-            if not has_dmarc:
-                with open("domains_without_dmarc.txt", "a") as f:
-                    f.write(f"{domains}:{domain_id}\n")
-            else:
-                for record in records:
-                    if (record["type"] == "TXT"
-                    and record.get("name", "").lower() == "_dmarc") : 
-                        record_id = record["id"]
-                        record_value = record["value"]
+        
+        domain_name = domain["name"]
+        domain_id = domain["id"]
+        
+        try:
+            records = get_domain_records(api_key, secret_key, domain_id)
+            has_dmarc = False
+            
+            for record in records:
+                if record["type"] == "TXT" and record.get("name", "").lower() == "_dmarc":
+                    has_dmarc = True
+                    value = record.get("value", "")
+                    normalized_value = normalize_dmarc(value)
+                    record_id = record["id"]
+                    
+                    # Check if it's a known policy that needs updating
+                    if (normalized_value in NORMALIZED_KNOWN_DMARC_RECORDS 
+                        and domain_name not in DOMAINS_TO_IGNORE):
+                        # Write immediately to preserve data on failure
                         with open("domains_with_dmarc.txt", "a") as f:
-                            f.write(f"{domains}:{domain_id}:{record_id}:{record_value}\n")
-    return None
+                            f.write(f"{domain_name}:{domain_id}:{record_id}:{normalized_value}\n")
+                        domains_with_dmarc += 1
+                    break
+            
+            # If no DMARC record found, add to list
+            if not has_dmarc and domain_name not in DOMAINS_TO_IGNORE:
+                with open("domains_without_dmarc.txt", "a") as f:
+                    f.write(f"{domain_name}:{domain_id}\n")
+                domains_without_dmarc += 1
+                    
+        except Exception as e:
+            print(f"Warning: Error processing domain {domain_name}: {str(e)}")
+            continue
+    
+    print("-" * 50)
+    print(f"DMARC extraction complete")
+    print(f"   Domains without DMARC records: {domains_without_dmarc}")
+    print(f"   Domains with non-compliant DMARC: {domains_with_dmarc}")
+    print("-" * 50)
 
-#Add DMARC record
-def add_dmarc_record(line):
-        #Parse domain name and id
-        time.sleep(2)
-        domain, domain_id = ln.strip().split(":")
+def update_dmarc_records(api_key, secret_key):
+    """
+    Update DMARC records (add new or update existing).
+    Processes both domains_with_dmarc.txt and domains_without_dmarc.txt
+    in a single unified operation.
+    """
+    # New DMARC record to apply
+    new_dmarc_value = "v=DMARC1; p=reject; sp=reject; fo=1"
+    
+    dmarc_record = {
+        "type": "TXT",
+        "name": "_dmarc",
+        "value": new_dmarc_value,
+        "gtdLocation": "DEFAULT",
+        "ttl": 3600
+    }
+    
+    count = 0
+    success_count = 0
+    failed_count = 0
+    
+    # Update existing DMARC records
+    if os.path.exists("domains_with_dmarc.txt"):
+        print("\nUpdating existing DMARC records...")
+        with open("domains_with_dmarc.txt", "r") as f:
+            for line in f:
+                time.sleep(REQUEST_SLEEP)
+                
+                # Extract domain first so it's always available for error reporting
+                domain = line.split(":")[0].strip()
+                
+                try:
+                    parts = line.strip().split(":", 3)
+                    if len(parts) < 4:
+                        continue
+                    
+                    domain, domain_id, record_id, _ = parts
+                    count += 1
+                    
+                    print(f"({count}) Updating: {domain}")
+                    
+                    url = f"{BASE_URL}/dns/managed/{domain_id}/records/{record_id}"
+                    response = requests.put(
+                        url, 
+                        headers=generate_headers(api_key, secret_key), 
+                        data=json.dumps(dmarc_record)
+                    )
+                    
+                    if response.status_code == 200:
+                        print(f"    Success: Updated DMARC record for {domain}")
+                        success_count += 1
+                    else:
+                        print(f"    Failed to update {domain}. Status: {response.status_code}")
+                        failed_count += 1
+                        
+                except Exception as e:
+                    print(f"    Error updating {domain}: {str(e)}")
+                    failed_count += 1
+                    continue
+    
+    # Add new DMARC records
+    if os.path.exists("domains_without_dmarc.txt"):
+        print("\nAdding new DMARC records...")
+        with open("domains_without_dmarc.txt", "r") as f:
+            for line in f:
+                time.sleep(REQUEST_SLEEP)
+                
+                # Extract domain first so it's always available for error reporting
+                domain = line.split(":")[0].strip()
+                
+                try:
+                    parts = line.strip().split(":")
+                    if len(parts) < 2:
+                        continue
+                    
+                    domain, domain_id = parts[0], parts[1]
+                    count += 1
+                    
+                    print(f"({count}) Adding: {domain}")
+                    
+                    url = f"{BASE_URL}/dns/managed/{domain_id}/records"
+                    response = requests.post(
+                        url, 
+                        headers=generate_headers(api_key, secret_key), 
+                        data=json.dumps(dmarc_record)
+                    )
+                    
+                    if response.status_code == 201:
+                        print(f"    Success: Added DMARC record for {domain}")
+                        success_count += 1
+                    else:
+                        print(f"    Failed to add for {domain}. Status: {response.status_code}")
+                        failed_count += 1
+                        
+                except Exception as e:
+                    print(f"    Error adding for {domain}: {str(e)}")
+                    failed_count += 1
+                    continue
+    
+    print("-" * 50)
+    print(f"DMARC update complete")
+    print(f"   Successful updates: {success_count}")
+    print(f"   Failed updates: {failed_count}")
+    print("-" * 50)
 
-        dmarc_record = {
-                "type": "TXT",
-                "name": "_dmarc",
-                "value": "v=DMARC1; p=reject; sp=reject; fo=1",
-                "gtdLocation": "DEFAULT",
-                "ttl": 3600
-            }
-        generated_headers=generate_dnsme_headers(api_key, secret_key)
-        request_url = f"{base_url}dns/managed/{domain_id}/records"
-        #print(f"Domain: {domain},Domain ID: {domain_id}\n Record details:\n{dmarc_record}\n URL: {request_url} \n\n")
-        response = requests.post(request_url, headers = generated_headers, data=json.dumps(dmarc_record))
-        if response.status_code == 201:
-            print(f"DMARC record added for domain: {domain}")
+# =====================
+# MAIN MENU
+# =====================
+
+def main():
+    """Main menu loop"""
+    print("\n" + "=" * 60)
+    print("DNSMadeEasy DMARC Record Manager")
+    print("=" * 60)
+    
+    # Get credentials from user
+    api_key = input("\nEnter your API Key: ").strip()
+    secret_key = input("Enter your API Secret: ").strip()
+    
+    if not api_key or not secret_key:
+        print("Error: API Key and Secret are required")
+        return
+    
+    while True:
+        print("\nSelect an option:")
+        print("1. Extract domains with invalid DMARC records")
+        print("2. Update DMARC records (add new or update existing)")
+        print("3. Exit")
+        
+        choice = input("\nEnter your choice (1-3): ").strip()
+        
+        if choice == "1":
+            try:
+                print("\nRetrieving all domains...")
+                domains = get_domains(api_key, secret_key)
+                print(f"Found {len(domains)} domains")
+                extract_dmarc_records(api_key, secret_key, domains)
+            except Exception as e:
+                print(f"Error: {str(e)}")
+                
+        elif choice == "2":
+            try:
+                update_dmarc_records(api_key, secret_key)
+            except Exception as e:
+                print(f"Error: {str(e)}")
+                
+        elif choice == "3":
+            print("Exiting...")
+            break
         else:
-            print(f"Failed to add DMARC record for domain: {domain}. Status code: {response.status_code} {response.text}")
+            print("Invalid choice. Please enter 1, 2, or 3.")
 
-# Production Details
-api_key = "de4beed6-e415-44b2-b30c-b0e86c942e9b"
-secret_key = "b9ce5f47-f1c4-4e47-b417-f29e8471e49d"
-base_url="https://api.dnsmadeeasy.com/V2.0/"
-
-# Sandbox Environment
-"""api_key = "e03666d0-19f4-46bb-ad47-d3d9659f9093"
-secret_key = "d86a71e3-aa6e-4015-a348-5639aec87593"
-base_url = "https://api.sandbox.dnsmadeeasy.com/V2.0/" """
-
-print(f"This script is developed to perform multiple tasks. Please select the task you want to be completed:")
-print(f"1. Create report with domains without DNS records")
-print("2. Update DNS records based on created report")
-print("3. Exit script execution")
-user_choice = input("Please choose an option: ")
-
-#Setting function results to variables in order to not repeat API calls
-while user_choice != "3":
-    if user_choice == "1":
-        open("domains_with_dmarc.txt", "w").close()
-        open("domains_without_dmarc.txt" , "w").close()
-        retrieved_domains = get_domains(api_key, secret_key, base_url)
-        domain_records = get_specific_domain_records(retrieved_domains)
-        domains_without_dmarc = get_domain_without_dmarc_record(domain_records)
-        print("-----------------")
-        print(f"All domains are retrieved and checked for DMARC records. Please check the report file: domains_without_dmarc.txt")
-        print("-----------------")
-    elif user_choice == "2":
-        with open ("domains_without_dmarc.txt") as f:
-            for ln in f:
-                print(ln)
-                add_dmarc_record(ln)
-    else:
-        print("Invalid Input. Please select between 1, 2, 3.")
-    print("Make your selection: ")
-    user_choice = input()
+if __name__ == "__main__":
+    main()
