@@ -14,16 +14,17 @@ A Python utility to identify and update non-compliant DMARC records across your 
 ## Prerequisites
 
 - Python 3.11 or higher
+- uv installed (https://docs.astral.sh/uv/)
 - DNSMadeEasy API credentials (API Key and Secret)
 - Internet connectivity to access DNSMadeEasy API
 
 ## Installation
 
 1. Clone or download this repository
-2. Install dependencies:
+2. Create/update the environment with uv:
 
 ```bash
-pip install -r requirements.txt  # installs requests
+uv sync
 ```
 
 ## Usage
@@ -31,7 +32,7 @@ pip install -r requirements.txt  # installs requests
 Run the script:
 
 ```bash
-python DNSMadeEasy-DMARC-Fix.py
+uv run python DNSMadeEasy-DMARC-Fix.py
 ```
 
 You will be prompted to enter your API Key and Secret. The script presents an interactive menu:
